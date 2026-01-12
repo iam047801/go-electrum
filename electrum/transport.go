@@ -17,8 +17,10 @@ type TCPTransport struct {
 }
 
 // NewTCPTransport opens a new TCP connection to the remote server.
-func NewTCPTransport(ctx context.Context, addr string) (*TCPTransport, error) {
-	var d net.Dialer
+func NewTCPTransport(ctx context.Context, addr string, timeout time.Duration) (*TCPTransport, error) {
+	d := net.Dialer{
+		Timeout: timeout,
+	}
 
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -71,8 +72,8 @@ type Client struct {
 }
 
 // NewClientTCP initialize a new client for remote server and connects to the remote server using TCP
-func NewClientTCP(ctx context.Context, addr string) (*Client, error) {
-	transport, err := NewTCPTransport(ctx, addr)
+func NewClientTCP(ctx context.Context, addr string, dialTimeout time.Duration) (*Client, error) {
+	transport, err := NewTCPTransport(ctx, addr, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
