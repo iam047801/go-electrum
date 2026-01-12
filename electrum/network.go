@@ -26,20 +26,11 @@ var (
 	// DebugMode provides debug output on communications with the remote server if enabled.
 	DebugMode bool
 
-	// ErrServerConnected throws an error if remote server is already connected.
-	ErrServerConnected = errors.New("server is already connected")
-
 	// ErrServerShutdown throws an error if remote server has shutdown.
 	ErrServerShutdown = errors.New("server has shutdown")
 
 	// ErrTimeout throws an error if request has timed out
 	ErrTimeout = errors.New("request timeout")
-
-	// ErrNotImplemented throws an error if this RPC call has not been implemented yet.
-	ErrNotImplemented = errors.New("RPC call is not implemented")
-
-	// ErrDeprecated throws an error if this RPC call is deprecated.
-	ErrDeprecated = errors.New("RPC call has been deprecated")
 )
 
 // Transport provides interface to server transport.
@@ -111,15 +102,6 @@ func NewClientSSL(ctx context.Context, addr string, config *tls.Config) (*Client
 	go c.listen()
 
 	return c, nil
-}
-
-type apiErr struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-func (e *apiErr) Error() string {
-	return fmt.Sprintf("errNo: %d, errMsg: %s", e.Code, e.Message)
 }
 
 type APIError struct {
