@@ -121,10 +121,19 @@ func (e *apiErr) Error() string {
 	return fmt.Sprintf("errNo: %d, errMsg: %s", e.Code, e.Message)
 }
 
+type APIError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (A APIError) Error() string {
+	return fmt.Sprintf("code: %d, error: %s", A.Code, A.Message)
+}
+
 type response struct {
-	ID     uint64 `json:"id"`
-	Method string `json:"method"`
-	Error  string `json:"error"`
+	ID     uint64    `json:"id"`
+	Method string    `json:"method"`
+	Error  *APIError `json:"error,omitempty"`
 }
 
 func (s *Client) listen() {
@@ -152,9 +161,9 @@ func (s *Client) listen() {
 				if DebugMode {
 					log.Printf("Unmarshal received message failed: %v", err)
 				}
-				result.err = fmt.Errorf("Unmarshal received message failed: %v", err)
-			} else if msg.Error != "" {
-				result.err = errors.New(msg.Error)
+				result.err = fmt.Errorf("unmarshal received message failed: %v", err)
+			} else if msg.Error != nil {
+				result.err = msg.Error
 			}
 
 			if len(msg.Method) > 0 {
