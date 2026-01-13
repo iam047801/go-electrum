@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,16 +47,17 @@ type container struct {
 
 // Client stores information about the remote server.
 type Client struct {
-	transport Transport
+	transport   Transport
+	transportMx sync.Mutex
 
 	handlers     map[uint64]chan *container
-	handlersLock sync.RWMutex
+	handlersLock sync.Mutex
 
 	pushHandlers     map[string][]chan *container
-	pushHandlersLock sync.RWMutex
+	pushHandlersLock sync.Mutex
 
-	Error chan error
-	quit  chan struct{}
+	quit     chan struct{}
+	quitOnce sync.Once
 
 	nextID uint64
 }
@@ -73,8 +73,7 @@ func NewClientTCP(ctx context.Context, addr string, dialTimeout time.Duration) (
 		handlers:     make(map[uint64]chan *container),
 		pushHandlers: make(map[string][]chan *container),
 
-		Error: make(chan error),
-		quit:  make(chan struct{}),
+		quit: make(chan struct{}),
 	}
 
 	c.transport = transport
@@ -94,8 +93,7 @@ func NewClientSSL(ctx context.Context, addr string, config *tls.Config) (*Client
 		handlers:     make(map[uint64]chan *container),
 		pushHandlers: make(map[string][]chan *container),
 
-		Error: make(chan error),
-		quit:  make(chan struct{}),
+		quit: make(chan struct{}),
 	}
 
 	c.transport = transport
@@ -113,46 +111,99 @@ func (A APIError) Error() string {
 	return fmt.Sprintf("code: %d, error: %s", A.Code, A.Message)
 }
 
-type response struct {
+type responseHeader struct {
 	ID     uint64    `json:"id"`
 	Method string    `json:"method"`
 	Error  *APIError `json:"error,omitempty"`
 }
 
+func (s *Client) closePushHandlers() {
+	s.pushHandlersLock.Lock()
+	defer s.pushHandlersLock.Unlock()
+
+	for method, handlers := range s.pushHandlers {
+		for _, handler := range handlers {
+			select {
+			case handler <- &container{err: ErrServerShutdown}:
+			default:
+			}
+
+			close(handler)
+		}
+
+		delete(s.pushHandlers, method)
+	}
+
+	s.pushHandlers = nil
+}
+
+func (s *Client) closeHandlers() {
+	s.handlersLock.Lock()
+	defer s.handlersLock.Unlock()
+
+	for id, c := range s.handlers {
+		c <- &container{err: ErrServerShutdown}
+
+		close(c)
+
+		delete(s.handlers, id)
+	}
+
+	s.handlers = nil
+}
+
+func (s *Client) getTransport() Transport {
+	s.transportMx.Lock()
+	defer s.transportMx.Unlock()
+
+	return s.transport
+}
+
+func (s *Client) parseResponseHeader(bytes []byte) (responseHeader, error) {
+	msg := responseHeader{}
+
+	err := json.Unmarshal(bytes, &msg)
+	if err != nil {
+		return msg, fmt.Errorf("unmarshal received message (%s) failed: %v", string(bytes), err)
+	}
+	if msg.Error != nil {
+		return msg, msg.Error
+	}
+
+	return msg, nil
+}
+
 func (s *Client) listen() {
+	defer s.closePushHandlers()
+	defer s.closeHandlers()
+
 	for {
-		if s.IsShutdown() {
-			break
+		transport := s.getTransport()
+		if transport == nil {
+			return
 		}
-		if s.transport == nil {
-			break
-		}
+
 		select {
 		case <-s.quit:
 			return
-		case err := <-s.transport.Errors():
-			s.Error <- err
+
+		case <-transport.Errors():
 			s.Shutdown()
-		case bytes := <-s.transport.Responses():
+
+		case bytes := <-transport.Responses():
 			result := &container{
 				content: bytes,
 			}
 
-			msg := &response{}
-			err := json.Unmarshal(bytes, msg)
+			hdr, err := s.parseResponseHeader(result.content)
 			if err != nil {
-				if DebugMode {
-					log.Printf("Unmarshal received message failed: %v", err)
-				}
-				result.err = fmt.Errorf("unmarshal received message failed: %v", err)
-			} else if msg.Error != nil {
-				result.err = msg.Error
+				result.err = err
 			}
 
-			if len(msg.Method) > 0 {
-				s.pushHandlersLock.RLock()
-				handlers := s.pushHandlers[msg.Method]
-				s.pushHandlersLock.RUnlock()
+			if len(hdr.Method) > 0 {
+				s.pushHandlersLock.Lock()
+				handlers := s.pushHandlers[hdr.Method]
+				s.pushHandlersLock.Unlock()
 
 				for _, handler := range handlers {
 					select {
@@ -162,25 +213,13 @@ func (s *Client) listen() {
 				}
 			}
 
-			s.handlersLock.RLock()
-			c, ok := s.handlers[msg.ID]
-			s.handlersLock.RUnlock()
-
-			if ok {
-				// TODO: very rare case. fix this memory leak, when nobody will read channel (in case of error)
+			s.handlersLock.Lock()
+			if c := s.handlers[hdr.ID]; c != nil {
 				c <- result
 			}
+			s.handlersLock.Unlock()
 		}
 	}
-}
-
-func (s *Client) listenPush(method string) <-chan *container {
-	c := make(chan *container, 1)
-	s.pushHandlersLock.Lock()
-	s.pushHandlers[method] = append(s.pushHandlers[method], c)
-	s.pushHandlersLock.Unlock()
-
-	return c
 }
 
 type request struct {
@@ -201,16 +240,18 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 		Method: method,
 		Params: params,
 	}
-
 	bytes, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-
 	bytes = append(bytes, nl)
 
-	err = s.transport.SendMessage(bytes)
-	if err != nil {
+	transport := s.getTransport()
+	if transport == nil {
+		return ErrServerShutdown
+	}
+
+	if err := transport.SendMessage(bytes); err != nil {
 		s.Shutdown()
 		return err
 	}
@@ -218,12 +259,19 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 	c := make(chan *container, 1)
 
 	s.handlersLock.Lock()
+	if s.handlers == nil {
+		s.handlersLock.Unlock()
+		return ErrServerShutdown
+	}
 	s.handlers[msg.ID] = c
 	s.handlersLock.Unlock()
 
 	defer func() {
 		s.handlersLock.Lock()
-		delete(s.handlers, msg.ID)
+		if _, ok := s.handlers[msg.ID]; ok {
+			close(s.handlers[msg.ID])
+			delete(s.handlers, msg.ID)
+		}
 		s.handlersLock.Unlock()
 	}()
 
@@ -233,14 +281,12 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 	case <-ctx.Done():
 		return ErrTimeout
 	}
-
 	if resp.err != nil {
 		return resp.err
 	}
 
 	if v != nil {
-		err = json.Unmarshal(resp.content, v)
-		if err != nil {
+		if err := json.Unmarshal(resp.content, v); err != nil {
 			return err
 		}
 	}
@@ -249,22 +295,14 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 }
 
 func (s *Client) Shutdown() {
-	if !s.IsShutdown() {
+	s.quitOnce.Do(func() {
 		close(s.quit)
-	}
+	})
+
+	s.transportMx.Lock()
 	if s.transport != nil {
 		_ = s.transport.Close()
 	}
 	s.transport = nil
-	s.handlers = nil
-	s.pushHandlers = nil
-}
-
-func (s *Client) IsShutdown() bool {
-	select {
-	case <-s.quit:
-		return true
-	default:
-	}
-	return false
+	s.transportMx.Unlock()
 }

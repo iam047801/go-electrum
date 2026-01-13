@@ -16,10 +16,22 @@ type TCPTransport struct {
 	errors    chan error
 }
 
+func newTransport(conn net.Conn) *TCPTransport {
+	tcp := &TCPTransport{
+		conn:      conn,
+		responses: make(chan []byte, 8),
+		errors:    make(chan error, 8),
+	}
+
+	go tcp.listen()
+
+	return tcp
+}
+
 // NewTCPTransport opens a new TCP connection to the remote server.
 func NewTCPTransport(ctx context.Context, addr string, timeout time.Duration) (*TCPTransport, error) {
 	d := net.Dialer{
-		Timeout: timeout,
+		Deadline: time.Now().Add(timeout),
 	}
 
 	conn, err := d.DialContext(ctx, "tcp", addr)
@@ -27,15 +39,7 @@ func NewTCPTransport(ctx context.Context, addr string, timeout time.Duration) (*
 		return nil, err
 	}
 
-	tcp := &TCPTransport{
-		conn:      conn,
-		responses: make(chan []byte),
-		errors:    make(chan error),
-	}
-
-	go tcp.listen()
-
-	return tcp, nil
+	return newTransport(conn), nil
 }
 
 // NewSSLTransport opens a new SSL connection to the remote server.
@@ -49,19 +53,14 @@ func NewSSLTransport(ctx context.Context, addr string, config *tls.Config) (*TCP
 		return nil, err
 	}
 
-	tcp := &TCPTransport{
-		conn:      conn,
-		responses: make(chan []byte),
-		errors:    make(chan error),
-	}
-
-	go tcp.listen()
-
-	return tcp, nil
+	return newTransport(conn), nil
 }
 
 func (t *TCPTransport) listen() {
+	defer close(t.responses)
+	defer close(t.errors)
 	defer t.conn.Close()
+
 	reader := bufio.NewReader(t.conn)
 
 	for {
